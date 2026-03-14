@@ -1,8 +1,7 @@
 import type { ImportSummary, Transaction, TransactionKind, UserProfile } from "./types";
 
-const storageKey = "finance-tracker-transactions";
-const importKey = "finance-tracker-imports";
-const profileKey = "finance-tracker-profile";
+const usersKey = "finance-tracker-users";
+const sessionKey = "finance-tracker-session";
 
 const debitHints = ["debit", "paid", "sent", "payment", "withdraw", "purchase"];
 const creditHints = ["credit", "received", "refund", "cashback", "deposit", "reversal"];
@@ -91,7 +90,9 @@ export function mapPdfBlock(block: string, index: number): Transaction | null {
 }
 
 export function loadTransactions() {
-  const stored = localStorage.getItem(storageKey);
+  const email = loadCurrentUserEmail();
+  if (!email) return [] as Transaction[];
+  const stored = localStorage.getItem(transactionStorageKey(email));
   if (!stored) return [] as Transaction[];
   try {
     return JSON.parse(stored) as Transaction[];
@@ -101,11 +102,15 @@ export function loadTransactions() {
 }
 
 export function saveTransactions(transactions: Transaction[]) {
-  localStorage.setItem(storageKey, JSON.stringify(transactions));
+  const email = loadCurrentUserEmail();
+  if (!email) return;
+  localStorage.setItem(transactionStorageKey(email), JSON.stringify(transactions));
 }
 
 export function loadImports() {
-  const stored = localStorage.getItem(importKey);
+  const email = loadCurrentUserEmail();
+  if (!email) return [] as ImportSummary[];
+  const stored = localStorage.getItem(importStorageKey(email));
   if (!stored) return [] as ImportSummary[];
   try {
     return JSON.parse(stored) as ImportSummary[];
@@ -115,27 +120,60 @@ export function loadImports() {
 }
 
 export function saveImports(imports: ImportSummary[]) {
-  localStorage.setItem(importKey, JSON.stringify(imports));
+  const email = loadCurrentUserEmail();
+  if (!email) return;
+  localStorage.setItem(importStorageKey(email), JSON.stringify(imports));
 }
 
-export function loadProfile() {
-  const stored = localStorage.getItem(profileKey);
-  if (!stored) return null as UserProfile | null;
+export function loadUsers() {
+  const stored = localStorage.getItem(usersKey);
+  if (!stored) return [] as UserProfile[];
   try {
-    return JSON.parse(stored) as UserProfile;
+    return JSON.parse(stored) as UserProfile[];
   } catch {
-    return null;
+    return [];
   }
 }
 
-export function saveProfile(profile: UserProfile) {
-  localStorage.setItem(profileKey, JSON.stringify(profile));
+export function saveUsers(users: UserProfile[]) {
+  localStorage.setItem(usersKey, JSON.stringify(users));
+}
+
+export function loadCurrentUserEmail() {
+  return localStorage.getItem(sessionKey);
+}
+
+export function setCurrentUserEmail(email: string) {
+  localStorage.setItem(sessionKey, email.toLowerCase());
+}
+
+export function clearCurrentUserEmail() {
+  localStorage.removeItem(sessionKey);
+}
+
+export function loadProfile() {
+  const email = loadCurrentUserEmail();
+  if (!email) return null as UserProfile | null;
+  return loadUsers().find((user) => user.email === email) ?? null;
+}
+
+export function upsertUser(profile: UserProfile) {
+  const users = loadUsers();
+  const nextUsers = users.some((user) => user.email === profile.email)
+    ? users.map((user) => (user.email === profile.email ? profile : user))
+    : [...users, profile];
+  saveUsers(nextUsers);
+  setCurrentUserEmail(profile.email);
 }
 
 export function clearStoredFinanceData() {
-  localStorage.removeItem(storageKey);
-  localStorage.removeItem(importKey);
-  localStorage.removeItem(profileKey);
+  const users = loadUsers();
+  for (const user of users) {
+    localStorage.removeItem(transactionStorageKey(user.email));
+    localStorage.removeItem(importStorageKey(user.email));
+  }
+  localStorage.removeItem(usersKey);
+  localStorage.removeItem(sessionKey);
 }
 
 export function currency(amount: number) {
@@ -171,4 +209,12 @@ export function dayLabel(isoDate: string) {
 
 export function sanitizeMobileNumber(value: string) {
   return value.replace(/\D/g, "").slice(-10);
+}
+
+function transactionStorageKey(email: string) {
+  return `finance-tracker-transactions:${email.toLowerCase()}`;
+}
+
+function importStorageKey(email: string) {
+  return `finance-tracker-imports:${email.toLowerCase()}`;
 }
