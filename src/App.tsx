@@ -1,16 +1,23 @@
-import Papa, { type ParseResult } from "papaparse";
-import { useEffect, useMemo, useState } from "react";
-import type { ImportSummary, Transaction } from "./types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  downloadAttachment,
+  renderGoogleSignInButton,
+  requestGmailAccess,
+  searchPhonePePdfAttachments,
+} from "./google";
+import type { GmailAttachmentMatch, ImportSummary, Transaction, UserProfile } from "./types";
 import {
   clearStoredFinanceData,
   compactCurrency,
   currency,
   dayLabel,
   loadImports,
+  loadProfile,
   loadTransactions,
-  mapCsvRow,
   monthLabel,
+  sanitizeMobileNumber,
   saveImports,
+  saveProfile,
   saveTransactions,
 } from "./utils";
 
@@ -23,26 +30,47 @@ type Insight = {
 function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [imports, setImports] = useState<ImportSummary[]>([]);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [draft, setDraft] = useState({ name: "", email: "", mobileNumber: "" });
   const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [gmailToken, setGmailToken] = useState("");
+  const [gmailFiles, setGmailFiles] = useState<GmailAttachmentMatch[]>([]);
+  const googleButtonRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setTransactions(loadTransactions());
     setImports(loadImports());
+    const storedProfile = loadProfile();
+    setProfile(storedProfile);
+    if (storedProfile) {
+      setDraft(storedProfile);
+    }
   }, []);
 
-  const metrics = useMemo(() => {
-    const totalSpend = transactions
-      .filter((item) => item.kind === "debit")
-      .reduce((sum, item) => sum + item.amount, 0);
-    const totalIncome = transactions
-      .filter((item) => item.kind === "credit")
-      .reduce((sum, item) => sum + item.amount, 0);
-    const net = totalIncome - totalSpend;
-    const avgSpend =
-      transactions.filter((item) => item.kind === "debit").length > 0
-        ? totalSpend / transactions.filter((item) => item.kind === "debit").length
-        : 0;
+  useEffect(() => {
+    if (profile || !googleButtonRef.current) return;
 
+    renderGoogleSignInButton(googleButtonRef.current, ({ name, email }) => {
+      setDraft((current) => ({
+        ...current,
+        name: current.name || name,
+        email,
+      }));
+      setStatus("Google account verified. Complete your name and mobile number to create the account.");
+      setError("");
+    }).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : "Google Sign-In could not be loaded.");
+    });
+  }, [profile]);
+
+  const metrics = useMemo(() => {
+    const debits = transactions.filter((item) => item.kind === "debit");
+    const credits = transactions.filter((item) => item.kind === "credit");
+    const totalSpend = debits.reduce((sum, item) => sum + item.amount, 0);
+    const totalIncome = credits.reduce((sum, item) => sum + item.amount, 0);
+    const net = totalIncome - totalSpend;
+    const avgSpend = debits.length > 0 ? totalSpend / debits.length : 0;
     return { totalSpend, totalIncome, net, avgSpend };
   }, [transactions]);
 
@@ -77,14 +105,20 @@ function App() {
     () =>
       [...transactions]
         .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-        .slice(0, 7),
+        .slice(0, 8),
     [transactions],
   );
 
   const insights = useMemo<Insight[]>(() => {
     if (transactions.length === 0) {
       return [
-        { title: "Ready to ingest", value: "Import a PhonePe CSV to build your personal trends.", tone: "neutral" },
+        {
+          title: "Ready to ingest",
+          value: profile
+            ? "Connect Gmail or upload a PhonePe PDF. Your mobile number is used as the statement password."
+            : "Create an account and connect Gmail to auto-pull PhonePe statements.",
+          tone: "neutral",
+        },
       ];
     }
 
@@ -115,50 +149,138 @@ function App() {
         tone: last7Total > metrics.avgSpend * 8 ? "warning" : "success",
       },
     ];
-  }, [metrics.avgSpend, topCategories, transactions]);
+  }, [metrics.avgSpend, profile, topCategories, transactions]);
 
-  function handleImport(file: File) {
+  async function ingestPdf(file: File, source: string) {
+    if (!profile) {
+      setError("Create an account first so the app can use your mobile number as the PDF password.");
+      return;
+    }
+
     setError("");
-    Papa.parse<Record<string, string>>(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: (result: ParseResult<Record<string, string>>) => {
-        const mapped = result.data
-          .map((row: Record<string, string>, index: number) => mapCsvRow(row, index))
-          .filter((row: Transaction) => row.amount > 0);
+    setStatus(`Parsing ${file.name}...`);
 
-        if (mapped.length === 0) {
-          setError("No transactions were detected in this CSV. Check the export format and try again.");
-          return;
-        }
+    try {
+      const { parsePhonePePdf } = await import("./pdf");
+      const { transactions: parsedTransactions } = await parsePhonePePdf(file, profile.mobileNumber);
 
-        const existing = loadTransactions();
-        const merged = dedupe([...mapped, ...existing]);
-        const updatedImports = [
-          {
-            fileName: file.name,
-            importedAt: new Date().toISOString(),
-            rowCount: mapped.length,
-          },
-          ...loadImports(),
-        ].slice(0, 8);
+      if (parsedTransactions.length === 0) {
+        setError("No transactions were detected in this PDF. Check the PhonePe statement format and try again.");
+        setStatus("");
+        return;
+      }
 
-        setTransactions(merged);
-        setImports(updatedImports);
-        saveTransactions(merged);
-        saveImports(updatedImports);
-      },
-      error: () => {
-        setError("The CSV could not be parsed. Try exporting it again from PhonePe.");
-      },
-    });
+      const merged = dedupe([...parsedTransactions, ...loadTransactions()]);
+      const updatedImports = [
+        {
+          fileName: source,
+          importedAt: new Date().toISOString(),
+          rowCount: parsedTransactions.length,
+        },
+        ...loadImports(),
+      ].slice(0, 12);
+
+      setTransactions(merged);
+      setImports(updatedImports);
+      saveTransactions(merged);
+      saveImports(updatedImports);
+      setStatus(`Imported ${parsedTransactions.length} transactions from ${source}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The PhonePe PDF could not be parsed.");
+      setStatus("");
+    }
+  }
+
+  function handleCreateAccount(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const mobileNumber = sanitizeMobileNumber(draft.mobileNumber);
+
+    if (!draft.name.trim()) {
+      setError("Enter your name.");
+      return;
+    }
+
+    if (!draft.email.trim().endsWith("@gmail.com")) {
+      setError("Use a Gmail address so inbox sync can work.");
+      return;
+    }
+
+    if (mobileNumber.length !== 10) {
+      setError("Enter the 10-digit mobile number used as your PhonePe PDF password.");
+      return;
+    }
+
+    const nextProfile: UserProfile = {
+      name: draft.name.trim(),
+      email: draft.email.trim().toLowerCase(),
+      mobileNumber,
+      gmailConnectedAt: profile?.gmailConnectedAt,
+    };
+
+    saveProfile(nextProfile);
+    setProfile(nextProfile);
+    setDraft(nextProfile);
+    setError("");
+    setStatus("Account created locally on this device. Connect Gmail to start pulling PhonePe statements.");
+  }
+
+  async function handleGmailConnect() {
+    if (!profile) {
+      setError("Create an account first.");
+      return;
+    }
+
+    setError("");
+    setStatus("Requesting Gmail access...");
+
+    try {
+      const token = await requestGmailAccess();
+      setGmailToken(token);
+      const files = await searchPhonePePdfAttachments(token);
+      setGmailFiles(files);
+
+      const updatedProfile = {
+        ...profile,
+        gmailConnectedAt: new Date().toISOString(),
+      };
+      setProfile(updatedProfile);
+      saveProfile(updatedProfile);
+
+      setStatus(files.length ? `Found ${files.length} PhonePe PDF attachments in Gmail.` : "Gmail connected. No PhonePe PDFs found yet.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Gmail connection failed.");
+      setStatus("");
+    }
+  }
+
+  async function handleAttachmentImport(item: GmailAttachmentMatch) {
+    if (!gmailToken) {
+      setError("Reconnect Gmail before importing from inbox.");
+      return;
+    }
+
+    setError("");
+    setStatus(`Downloading ${item.fileName} from Gmail...`);
+
+    try {
+      const file = await downloadAttachment(gmailToken, item.messageId, item.attachmentId, item.fileName);
+      await ingestPdf(file, `${item.fileName} via Gmail`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The PhonePe PDF could not be downloaded from Gmail.");
+      setStatus("");
+    }
   }
 
   function clearAll() {
     clearStoredFinanceData();
     setTransactions([]);
     setImports([]);
+    setProfile(null);
+    setDraft({ name: "", email: "", mobileNumber: "" });
+    setGmailFiles([]);
+    setGmailToken("");
     setError("");
+    setStatus("");
   }
 
   return (
@@ -169,34 +291,160 @@ function App() {
       <header className="hero">
         <div>
           <span className="eyebrow">PhonePe Finance Tracker</span>
-          <h1>One clean dashboard for every export you pull each day.</h1>
+          <h1>Inbox-connected money tracking that works on your phone.</h1>
           <p>
-            Upload CSV files, keep a running ledger in the browser, and surface spending trends without touching a spreadsheet.
+            Create an account, connect Gmail, pull only PhonePe statement mails, unlock PDFs with your stored mobile
+            number, and keep the dashboard current without manual sorting.
           </p>
         </div>
 
         <div className="hero-actions">
-          <label className="upload-card">
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) handleImport(file);
-                event.target.value = "";
-              }}
-            />
-            <span>Import CSV</span>
-            <small>Append today&apos;s export in one click</small>
-          </label>
+          {profile ? (
+            <div className="profile-card">
+              <strong>{profile.name}</strong>
+              <span>{profile.email}</span>
+              <span>PhonePe mobile: {profile.mobileNumber}</span>
+              <small>{profile.gmailConnectedAt ? "Gmail connected" : "Gmail not connected yet"}</small>
+            </div>
+          ) : (
+            <div className="profile-card muted">
+              <strong>Account required</strong>
+              <span>Use Google to verify Gmail, then save your PhonePe mobile number.</span>
+            </div>
+          )}
 
           <button className="ghost-button" onClick={clearAll} type="button">
-            Reset local data
+            Reset local workspace
           </button>
         </div>
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
+      {status ? <div className="status-banner">{status}</div> : null}
+
+      {!profile ? (
+        <section className="auth-grid">
+          <div className="panel auth-panel">
+            <div className="panel-header">
+              <div>
+                <span className="panel-kicker">Step 1</span>
+                <h2>Create account</h2>
+              </div>
+            </div>
+            <form className="auth-form" onSubmit={handleCreateAccount}>
+              <label>
+                <span>Full name</span>
+                <input
+                  value={draft.name}
+                  onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+                  placeholder="Sidwik Reddy"
+                />
+              </label>
+              <label>
+                <span>Gmail address</span>
+                <input
+                  value={draft.email}
+                  onChange={(event) => setDraft((current) => ({ ...current, email: event.target.value }))}
+                  placeholder="you@gmail.com"
+                  type="email"
+                />
+              </label>
+              <label>
+                <span>PhonePe mobile number</span>
+                <input
+                  inputMode="numeric"
+                  value={draft.mobileNumber}
+                  onChange={(event) => setDraft((current) => ({ ...current, mobileNumber: event.target.value }))}
+                  placeholder="10-digit mobile"
+                />
+              </label>
+              <button className="primary-button" type="submit">
+                Save account
+              </button>
+            </form>
+          </div>
+
+          <div className="panel auth-panel">
+            <div className="panel-header">
+              <div>
+                <span className="panel-kicker">Step 2</span>
+                <h2>Verify Gmail</h2>
+              </div>
+            </div>
+            <p className="auth-copy">
+              The app uses Google Sign-In to confirm the Gmail account and later asks separately for read-only Gmail
+              access. It only searches for PhonePe emails with PDF attachments.
+            </p>
+            <div className="google-button-slot" ref={googleButtonRef} />
+            <small className="fine-print">Requires `VITE_GOOGLE_CLIENT_ID` in the deployment environment.</small>
+          </div>
+        </section>
+      ) : (
+        <section className="action-grid">
+          <div className="panel action-panel">
+            <div className="panel-header">
+              <div>
+                <span className="panel-kicker">Sync</span>
+                <h2>Gmail import</h2>
+              </div>
+            </div>
+            <p className="auth-copy">
+              Connect Gmail with read-only access, list recent PhonePe PDF mails, and import any statement directly on
+              desktop or mobile.
+            </p>
+            <button className="primary-button" onClick={handleGmailConnect} type="button">
+              Connect Gmail
+            </button>
+          </div>
+
+          <label className="upload-card panel action-panel">
+            <input
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void ingestPdf(file, file.name);
+                event.target.value = "";
+              }}
+            />
+            <span>Manual PDF import</span>
+            <small>Fallback when you already downloaded the statement.</small>
+          </label>
+        </section>
+      )}
+
+      {profile ? (
+        <section className="panel inbox-panel">
+          <div className="panel-header">
+            <div>
+              <span className="panel-kicker">Inbox</span>
+              <h2>PhonePe emails</h2>
+            </div>
+            <span className="pill">{gmailFiles.length} files</span>
+          </div>
+
+          {gmailFiles.length === 0 ? (
+            <p className="empty-state">Connect Gmail to search for PhonePe PDF statements from your inbox.</p>
+          ) : (
+            <div className="mail-list">
+              {gmailFiles.map((item) => (
+                <article className="mail-row" key={`${item.messageId}-${item.attachmentId}`}>
+                  <div>
+                    <strong>{item.fileName}</strong>
+                    <span>{item.subject}</span>
+                    <small>
+                      {new Date(Number(item.internalDate)).toLocaleString("en-IN")} • {item.from}
+                    </small>
+                  </div>
+                  <button className="ghost-button compact" onClick={() => void handleAttachmentImport(item)} type="button">
+                    Import
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      ) : null}
 
       <section className="stats-grid">
         <MetricCard label="Total spend" value={currency(metrics.totalSpend)} detail="All debits imported so far" tone="warning" />
@@ -250,12 +498,12 @@ function App() {
           <div className="panel-header">
             <div>
               <span className="panel-kicker">Import history</span>
-              <h2>Recent CSV ingests</h2>
+              <h2>Recent imports</h2>
             </div>
           </div>
           <div className="import-list">
             {imports.length === 0 ? (
-              <p className="empty-state">No CSV imported yet.</p>
+              <p className="empty-state">No statement imported yet.</p>
             ) : (
               imports.map((entry) => (
                 <article className="import-row" key={`${entry.fileName}-${entry.importedAt}`}>
@@ -281,14 +529,16 @@ function App() {
         </div>
 
         {recentTransactions.length === 0 ? (
-          <p className="empty-state">Import a CSV to populate the ledger.</p>
+          <p className="empty-state">Connect Gmail or import a PhonePe PDF to populate the ledger.</p>
         ) : (
           <div className="transaction-table">
             {recentTransactions.map((item) => (
               <article className="transaction-row" key={item.id}>
                 <div>
                   <strong>{item.counterparty}</strong>
-                  <span>{dayLabel(item.date)} • {item.category} • {item.method}</span>
+                  <span>
+                    {dayLabel(item.date)} • {item.category} • {item.method}
+                  </span>
                 </div>
                 <div className="transaction-meta">
                   <strong className={item.kind === "credit" ? "positive" : "negative"}>
